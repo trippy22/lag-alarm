@@ -36,12 +36,12 @@ public class LagAlarmOverlay extends Overlay
     public Dimension render(Graphics2D graphics)
     {
         LagDetector.Snapshot snapshot = plugin.getSnapshot();
-        if (snapshot.mode == LagDetector.Mode.IDLE || !snapshot.isAlarm()) { return null; }
+        if (snapshot.mode == LagDetector.Mode.IDLE || !snapshot.hasWarning()) { return null; }
         VisualAlert visual = config.visualAlert();
         if (visual == VisualAlert.OFF) { return null; }
         Color color = new Color(255, 176, 64);
         LagAlarmPainter.paint(graphics, client.getCanvasWidth(), client.getCanvasHeight(), chatboxBounds(),
-            snapshot, color, visual == VisualAlert.BANNER_AND_BORDER, LagAlarmPlugin.now());
+            snapshot, color, visual == VisualAlert.BANNER_AND_BORDER && snapshot.isAlarm(), LagAlarmPlugin.now());
         return null;
     }
 

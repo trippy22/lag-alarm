@@ -21,6 +21,8 @@ public class LagAlarmPreview
         render(directory, "fixed-hide-chat", 765, 503, new Rectangle(0, 338, 519, 165), VisualAlert.BANNER_AND_BORDER, false);
         render(directory, "collapsed-chat", 1200, 800, new Rectangle(0, 775, 519, 25), VisualAlert.BANNER);
         render(directory, "visual-off", 765, 503, new Rectangle(0, 338, 519, 165), VisualAlert.OFF);
+        render(directory, "icmp-caution", 765, 503, new Rectangle(0, 338, 519, 165), VisualAlert.BANNER_AND_BORDER);
+        render(directory, "tcp-alarm", 765, 503, new Rectangle(0, 338, 519, 165), VisualAlert.BANNER_AND_BORDER);
     }
 
     private static void render(File directory, String name, int width, int height, Rectangle chatbox, VisualAlert visual) throws Exception
@@ -50,9 +52,20 @@ public class LagAlarmPreview
         {
             LagDetector.Snapshot snapshot = new LagDetector.Snapshot(LagDetector.Mode.MONITORING,
                 LagDetector.Reason.TICK_STALL, 301, 1800, -1, false);
+            if (name.equals("icmp-caution"))
+            {
+                snapshot = new LagDetector.Snapshot(LagDetector.Mode.MONITORING,
+                    LagDetector.Reason.PROBE_DELAY, 301, 500, -1, false, LagDetector.Confidence.CAUTION);
+            }
+            if (name.equals("tcp-alarm"))
+            {
+                snapshot = new LagDetector.Snapshot(LagDetector.Mode.MONITORING,
+                    LagDetector.Reason.TCP_LATENCY, 301, 200, 40, false);
+                snapshot.tcpRttMs = 500;
+            }
             Rectangle area = LagAlarmPainter.chatboxArea(width, height, chatbox, null);
             LagAlarmPainter.paint(g, width, height, area, snapshot, new Color(255, 176, 64),
-                visual == VisualAlert.BANNER_AND_BORDER, 400);
+                visual == VisualAlert.BANNER_AND_BORDER && snapshot.isAlarm(), 400);
         }
         g.setColor(new Color(165, 174, 180));
         g.drawString("Lag Alarm / " + name + " / layout preview, not a game screenshot", 22, 24);

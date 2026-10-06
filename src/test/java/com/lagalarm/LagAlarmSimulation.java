@@ -17,6 +17,7 @@ public class LagAlarmSimulation
         StringBuilder report = new StringBuilder("SIMULATED detection latency; not a measurement of your network.\n");
         report.append("1000 randomized outage phases per profile; seed 20261006; watchdog 25 ms.\n");
         report.append("Baseline inputs: 0 ms RTT / 0% probe loss. Complete outage begins after calibration.\n");
+        report.append("Measures audible-alarm eligibility, not the earlier silent caution. TCP stats unavailable in this simulation.\n");
         report.append("profile,mean_ms,p50_ms,p95_ms,p99_ms,min_ms,max_ms\n");
         for (int mode = 0; mode < 4; mode++)
         {
@@ -32,7 +33,7 @@ public class LagAlarmSimulation
             report.append(String.format(Locale.ROOT, "%s,%.2f,%d,%d,%d,%d,%d%n", profile, mean,
                 values[499], values[949], values[989], values[0], values[999]));
         }
-        report.append("Fast warning is possible probe delay, not confirmed game-packet loss.\n");
+        report.append("Automatic probe-only cautions escalate when game updates are also overdue. Not confirmed game-packet loss.\n");
         report.append("Zero RTT is a synthetic lower bound, not a normal internet latency claim.\n");
         Files.writeString(output.resolve("simulation.csv"), report, StandardCharsets.UTF_8);
         System.out.print(report);
