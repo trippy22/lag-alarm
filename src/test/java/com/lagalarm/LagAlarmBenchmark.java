@@ -52,6 +52,7 @@ public class LagAlarmBenchmark
         AtomicInteger checks = new AtomicInteger();
         AtomicLong maxCheck = new AtomicLong();
         AtomicInteger alarms = new AtomicInteger();
+        AtomicInteger cautions = new AtomicInteger();
         List<Integer> roundTrips = Collections.synchronizedList(new ArrayList<>());
         List<Integer> watchdogGaps = Collections.synchronizedList(new ArrayList<>());
         AtomicLong previousCheck = new AtomicLong();
@@ -65,7 +66,9 @@ public class LagAlarmBenchmark
                 long started = System.nanoTime();
                 long previous = previousCheck.getAndSet(started);
                 if (previous != 0) { watchdogGaps.add((int) ((started - previous) / 1000)); }
-                if (detector.evaluate(LagAlarmPlugin.now()).isAlarm()) { alarms.incrementAndGet(); }
+                LagDetector.Snapshot state = detector.evaluate(LagAlarmPlugin.now());
+                if (state.isAlarm()) { alarms.incrementAndGet(); }
+                if (state.confidence == LagDetector.Confidence.CAUTION) { cautions.incrementAndGet(); }
                 maxCheck.accumulateAndGet(System.nanoTime() - started, Math::max);
                 checks.incrementAndGet();
             }, 0, 25, TimeUnit.MILLISECONDS);
@@ -108,6 +111,7 @@ public class LagAlarmBenchmark
                 + "Watchdog evaluations: %d%nMaximum evaluation cost: %.3f ms%n"
                 + "Actual watchdog gap p50/p95/p99: %.3f / %.3f / %.3f ms (requested 25 ms)%n"
                 + "Alarmed evaluations: %d (synthetic healthy game ticks)%n"
+                + "Silent caution evaluations: %d (no game socket attached in this harness)%n"
                 + "Process CPU: %.3f ms (%.4f%% of one logical core over this interval)%n"
                 + "Estimated minimum IPv4 bytes: %d (%.2f B/s)%n"
                 + "Traffic above is calculated from attempts/replies, NOT packet-capture measured bytes.%n"
@@ -119,7 +123,7 @@ public class LagAlarmBenchmark
                 percentile(successful, 0.50), percentile(successful, 0.95), percentile(successful, 0.99),
                 checks.get(), maxCheck.get() / 1e6,
                 percentile(watchdogGaps, .50) / 1000.0, percentile(watchdogGaps, .95) / 1000.0,
-                percentile(watchdogGaps, .99) / 1000.0, alarms.get(), cpuMs, cpuMs / (elapsed * 10),
+                percentile(watchdogGaps, .99) / 1000.0, alarms.get(), cautions.get(), cpuMs, cpuMs / (elapsed * 10),
                 estimatedIpBytes, estimatedIpBytes / elapsed);
             Files.writeString(output.resolve("live-summary.txt"), report, StandardCharsets.UTF_8);
             System.out.print(report);

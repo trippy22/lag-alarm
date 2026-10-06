@@ -8,6 +8,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
+import java.io.FileDescriptor;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -25,6 +26,7 @@ import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.worldhopper.ping.Ping;
+import net.runelite.client.plugins.worldhopper.ping.TCPInfo;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.HotkeyListener;
 import net.runelite.http.api.worlds.World;
@@ -56,6 +58,10 @@ public class LagAlarmPlugin extends Plugin
     private ScheduledExecutorService workers;
     private ScheduledFuture<?> watchdogFuture;
     private ScheduledFuture<?> pingFuture;
+    private ScheduledFuture<?> tcpFuture;
+    private volatile SocketTarget socketTarget;
+    private long nextSocketCapture;
+    private int socketCaptureFailures;
     private final AtomicBoolean soundPending = new AtomicBoolean();
     private long lastSound;
     private boolean previouslyAlarmed;
@@ -81,10 +87,13 @@ public class LagAlarmPlugin extends Plugin
         previouslyAlarmed = false;
         probePacer.reset();
         soundPending.set(false);
+        socketTarget = null;
+        nextSocketCapture = 0;
+        socketCaptureFailures = 0;
         long generation = ++runGeneration;
         running = true;
-        // Separate capacity for watchdog, blocking ping and audio: neither I/O task can hold up detection.
-        ScheduledExecutorService executor = Executors.newScheduledThreadPool(3, runnable ->
+        // Keep native socket queries, ICMP and audio off both the client thread and the watchdog.
+        ScheduledExecutorService executor = Executors.newScheduledThreadPool(4, runnable ->
         {
             Thread thread = new Thread(runnable, "lag-alarm-worker");
             thread.setDaemon(true);
@@ -100,6 +109,8 @@ public class LagAlarmPlugin extends Plugin
         watchdogFuture = executor.scheduleWithFixedDelay(() -> watch(generation, executor), 0, 25, TimeUnit.MILLISECONDS);
         // Fixed delay avoids backlogs or overlapping probes when ICMP times out.
         pingFuture = executor.scheduleWithFixedDelay(() -> probe(generation), 25, 25, TimeUnit.MILLISECONDS);
+        TcpPoller tcpPoller = new TcpPoller();
+        tcpFuture = executor.scheduleWithFixedDelay(() -> tcpPoller.poll(generation), 250, 250, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -109,6 +120,8 @@ public class LagAlarmPlugin extends Plugin
         runGeneration++;
         if (watchdogFuture != null) { watchdogFuture.cancel(true); watchdogFuture = null; }
         if (pingFuture != null) { pingFuture.cancel(true); pingFuture = null; }
+        if (tcpFuture != null) { tcpFuture.cancel(true); tcpFuture = null; }
+        socketTarget = null;
         if (workers != null) { workers.shutdownNow(); workers = null; }
         keyManager.unregisterKeyListener(testKey);
         overlayManager.remove(overlay);
@@ -129,7 +142,34 @@ public class LagAlarmPlugin extends Plugin
     @Subscribe
     public void onClientTick(ClientTick event)
     {
-        if (running) { detector.clientTick(now()); }
+        if (!running) { return; }
+        long time = now();
+        detector.clientTick(time);
+        if (time >= nextSocketCapture)
+        {
+            nextSocketCapture = time + 250;
+            // Client APIs stay on the client thread; only the immutable target crosses threads.
+            if (client.getGameState() == GameState.LOGGED_IN)
+            {
+                try
+                {
+                    FileDescriptor fd = client.getSocketFD();
+                    LagDetector.Probe request = detector.observeSocket(fd);
+                    socketTarget = fd == null || request == null ? null : new SocketTarget(fd, request);
+                    socketCaptureFailures = 0;
+                }
+                catch (RuntimeException | LinkageError ex)
+                {
+                    SocketTarget previous = socketTarget;
+                    socketTarget = null;
+                    if (previous != null) { detector.tcpUnavailable(previous.request, previous.fd); }
+                    socketCaptureFailures = Math.min(6, socketCaptureFailures + 1);
+                    nextSocketCapture = time + Math.min(30000, 1000L << (socketCaptureFailures - 1));
+                    log.debug("Game socket unavailable; tick and ICMP checks remain active", ex);
+                }
+            }
+            else { socketTarget = null; }
+        }
     }
 
     @Subscribe
@@ -140,6 +180,8 @@ public class LagAlarmPlugin extends Plugin
 
     private void updateState(GameState state)
     {
+        if (state != GameState.LOGGED_IN) { socketTarget = null; }
+        nextSocketCapture = 0;
         switch (state)
         {
             case LOGGED_IN: detector.loggedIn(client.getWorld(), now()); break;
@@ -247,6 +289,56 @@ public class LagAlarmPlugin extends Plugin
     private boolean isCurrent(long generation) { return running && generation == runGeneration; }
     LagDetector.Snapshot getSnapshot() { return snapshot; }
     static long now() { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime()); }
+
+    private static final class SocketTarget
+    {
+        final FileDescriptor fd;
+        final LagDetector.Probe request;
+        SocketTarget(FileDescriptor fd, LagDetector.Probe request) { this.fd = fd; this.request = request; }
+    }
+
+    private final class TcpPoller
+    {
+        private SocketTarget previous;
+        private long retryAt;
+        private int failures;
+
+        void poll(long generation)
+        {
+            if (!isCurrent(generation)) { return; }
+            SocketTarget target = socketTarget;
+            if (target == null) { return; }
+            if (previous == null || previous.fd != target.fd || previous.request.generation != target.request.generation)
+            {
+                previous = target;
+                failures = 0;
+                retryAt = 0;
+            }
+            if (now() < retryAt) { return; }
+            try
+            {
+                TCPInfo info = target.fd.valid() ? Ping.getTCPInfo(target.fd) : null;
+                if (info != null && info.getRTT() > 0 && info.getTransmitted() >= 0 && info.getRetransmitted() >= 0)
+                {
+                    // Native RTT is microseconds. Round up so a valid sub-millisecond sample stays valid.
+                    int rtt = (int) Math.min(Integer.MAX_VALUE, (info.getRTT() + 999) / 1000);
+                    if (isCurrent(generation))
+                    {
+                        detector.tcpSample(target.request, target.fd, rtt, info.getTransmitted(), info.getRetransmitted(), now());
+                    }
+                    failures = 0;
+                    return;
+                }
+            }
+            catch (RuntimeException | LinkageError ex)
+            {
+                log.debug("Game socket statistics unavailable; tick and ICMP checks remain active", ex);
+            }
+            if (isCurrent(generation)) { detector.tcpUnavailable(target.request, target.fd); }
+            failures = Math.min(6, failures + 1);
+            retryAt = now() + Math.min(30000, 1000L << (failures - 1));
+        }
+    }
 
     private static final class SoundSettings
     {

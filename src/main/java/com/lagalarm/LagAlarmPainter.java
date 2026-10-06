@@ -21,7 +21,7 @@ final class LagAlarmPainter
     static void paint(Graphics2D original, int width, int height, Rectangle chatbox, LagDetector.Snapshot snapshot,
         Color color, boolean pulse, long now)
     {
-        if (width < 140 || height < 140 || snapshot.mode == LagDetector.Mode.IDLE || !snapshot.isAlarm()) { return; }
+        if (width < 140 || height < 140 || snapshot.mode == LagDetector.Mode.IDLE || !snapshot.hasWarning()) { return; }
         Rectangle bounds = warningBounds(width, height, chatbox);
         if (bounds == null) { return; }
         int x = bounds.x;
@@ -48,7 +48,8 @@ final class LagAlarmPainter
             g.setColor(color);
             g.setStroke(new BasicStroke(2));
             g.drawRoundRect(x, y, w, bounds.height, 14, 14);
-            String title = snapshot.reason == LagDetector.Reason.TEST ? "LAG ALARM - TEST"
+            String title = snapshot.confidence == LagDetector.Confidence.CAUTION ? "PING WARNING"
+                : snapshot.reason == LagDetector.Reason.TEST ? "LAG ALARM - TEST"
                 : snapshot.reason == LagDetector.Reason.CLIENT_STALL ? "CLIENT DELAY DETECTED"
                 : snapshot.reason == LagDetector.Reason.PROBE_DELAY || snapshot.reason == LagDetector.Reason.PROBE_FAILURES
                 ? "CONNECTION WARNING" : "LAG DETECTED";
@@ -69,7 +70,8 @@ final class LagAlarmPainter
             g.setColor(new Color(172, 182, 196));
             String footer = snapshot.reason == LagDetector.Reason.TEST
                 ? "Preview only - connection unchanged"
-                : "WORLD " + snapshot.world + "  |  Waiting for stable game updates";
+                : snapshot.confidence == LagDetector.Confidence.CAUTION ? "Game connection trouble is not confirmed"
+                : "WORLD " + snapshot.world + "  |  Waiting for stable connection and updates";
             centered(g, footer, x, y + 81, w);
         }
         finally { g.dispose(); }
@@ -115,6 +117,8 @@ final class LagAlarmPainter
         {
             case CLIENT_STALL: return "Local client updates have also paused";
             case HIGH_PING: return "Sustained high ping - latest " + snapshot.pingMs + " ms";
+            case TCP_LATENCY: return "Game connection latency is high - latest " + snapshot.tcpRttMs + " ms";
+            case TCP_RETRANSMISSIONS: return "Game connection is repeatedly retransmitting data";
             case PROBE_DELAY: return "Ping reply delayed - connection may be unstable";
             case PROBE_FAILURES: return "Recent ping probes failed - check connection stability";
             case RECOVERING: return "Updates resumed - confirming recovery";

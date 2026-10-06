@@ -10,7 +10,7 @@ public interface LagAlarmConfig extends Config
     String GROUP = "lag-alarm";
 
     @ConfigItem(keyName = "soundEnabled", name = "Spoken lag alert", position = 0,
-        description = "Say 'lag' when a warning is active. Repeats every four seconds. Works independently of the visual alert.")
+        description = "Say 'lag' during an alarm, repeating every four seconds. Unconfirmed ping cautions remain silent. Works independently of the visual alert.")
     default boolean soundEnabled() { return true; }
 
     @ConfigItem(keyName = "visualAlert", name = "Visual alert", position = 1,
