@@ -34,7 +34,7 @@ import org.slf4j.LoggerFactory;
 
 @PluginDescriptor(name = "Lag Alarm", internalName = "lag-alarm",
     description = "Distinct visual and audio warnings for delayed game updates and sustained high ping",
-    tags = {"lag", "latency", "hardcore", "ironman", "alarm", "ping"}, enabledByDefault = false)
+    tags = {"lag", "latency", "hardcore", "ironman", "alarm", "ping"})
 public class LagAlarmPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(LagAlarmPlugin.class);
