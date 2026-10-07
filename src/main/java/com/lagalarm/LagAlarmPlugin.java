@@ -153,6 +153,7 @@ public class LagAlarmPlugin extends Plugin
             {
                 try
                 {
+                    // RuneLite's live game-socket handle for Ping.getTCPInfo(), not a filesystem path.
                     FileDescriptor fd = client.getSocketFD();
                     LagDetector.Probe request = detector.observeSocket(fd);
                     socketTarget = fd == null || request == null ? null : new SocketTarget(fd, request);

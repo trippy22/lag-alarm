@@ -34,13 +34,6 @@ Version **0.2.0**. Requires **JDK 11**.
 
 The launcher enables assertions (`-ea`). While logged in, press **Shift+F10** for a five-second alert preview. Jagex accounts need RuneLite's [development-client login setup](https://github.com/runelite/runelite/wiki/Using-Jagex-Accounts).
 
-Optional checks:
-
-```powershell
-.\gradlew.bat renderPreview simulate
-.\gradlew.bat benchmark '-PbenchmarkHost=127.0.0.1' '-PbenchmarkSeconds=30'
-```
-
 Manual in-game and cross-platform checks are still needed for 0.2.0.
 
 ## Credits and license

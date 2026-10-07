@@ -36,27 +36,3 @@ tasks.register('run', JavaExec) {
 tasks.named('jar') {
     from('runelite-plugin.properties')
 }
-
-tasks.register('renderPreview', JavaExec) {
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.lagalarm.LagAlarmPreview'
-    systemProperty 'java.awt.headless', 'true'
-    args layout.buildDirectory.dir('preview').get().asFile.absolutePath
-}
-
-tasks.register('benchmark', JavaExec) {
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.lagalarm.LagAlarmBenchmark'
-    args providers.gradleProperty('benchmarkHost').getOrElse('127.0.0.1'),
-        providers.gradleProperty('benchmarkSeconds').getOrElse('30'),
-        providers.gradleProperty('probeIntervalMs').getOrElse('500'),
-        providers.gradleProperty('probeDeadlineMs').getOrElse('600'),
-        providers.gradleProperty('benchmarkOutput').getOrElse(layout.buildDirectory.dir('benchmark').get().asFile.absolutePath),
-        providers.gradleProperty('benchmarkPolicy').getOrElse('automatic')
-}
-
-tasks.register('simulate', JavaExec) {
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.lagalarm.LagAlarmSimulation'
-    args layout.buildDirectory.dir('benchmark').get().asFile.absolutePath
-}
