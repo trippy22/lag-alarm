@@ -6,9 +6,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
-import java.io.FileDescriptor;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -154,16 +154,17 @@ public class LagAlarmPlugin extends Plugin
                 try
                 {
                     // RuneLite's live game-socket handle for Ping.getTCPInfo(), not a filesystem path.
-                    FileDescriptor fd = client.getSocketFD();
+                    var fd = client.getSocketFD();
                     LagDetector.Probe request = detector.observeSocket(fd);
-                    socketTarget = fd == null || request == null ? null : new SocketTarget(fd, request);
+                    socketTarget = fd == null || request == null ? null
+                        : new SocketTarget(fd, request, () -> fd.valid() ? Ping.getTCPInfo(fd) : null);
                     socketCaptureFailures = 0;
                 }
                 catch (RuntimeException | LinkageError ex)
                 {
                     SocketTarget previous = socketTarget;
                     socketTarget = null;
-                    if (previous != null) { detector.tcpUnavailable(previous.request, previous.fd); }
+                    if (previous != null) { detector.tcpUnavailable(previous.request, previous.socketIdentity); }
                     socketCaptureFailures = Math.min(6, socketCaptureFailures + 1);
                     nextSocketCapture = time + Math.min(30000, 1000L << (socketCaptureFailures - 1));
                     log.debug("Game socket unavailable; tick and ICMP checks remain active", ex);
@@ -293,9 +294,16 @@ public class LagAlarmPlugin extends Plugin
 
     private static final class SocketTarget
     {
-        final FileDescriptor fd;
+        final Object socketIdentity;
         final LagDetector.Probe request;
-        SocketTarget(FileDescriptor fd, LagDetector.Probe request) { this.fd = fd; this.request = request; }
+        final Supplier<TCPInfo> readTcpInfo;
+
+        SocketTarget(Object socketIdentity, LagDetector.Probe request, Supplier<TCPInfo> readTcpInfo)
+        {
+            this.socketIdentity = socketIdentity;
+            this.request = request;
+            this.readTcpInfo = readTcpInfo;
+        }
     }
 
     private final class TcpPoller
@@ -309,7 +317,8 @@ public class LagAlarmPlugin extends Plugin
             if (!isCurrent(generation)) { return; }
             SocketTarget target = socketTarget;
             if (target == null) { return; }
-            if (previous == null || previous.fd != target.fd || previous.request.generation != target.request.generation)
+            if (previous == null || previous.socketIdentity != target.socketIdentity
+                || previous.request.generation != target.request.generation)
             {
                 previous = target;
                 failures = 0;
@@ -318,14 +327,14 @@ public class LagAlarmPlugin extends Plugin
             if (now() < retryAt) { return; }
             try
             {
-                TCPInfo info = target.fd.valid() ? Ping.getTCPInfo(target.fd) : null;
+                TCPInfo info = target.readTcpInfo.get();
                 if (info != null && info.getRTT() > 0 && info.getTransmitted() >= 0 && info.getRetransmitted() >= 0)
                 {
                     // Native RTT is microseconds. Round up so a valid sub-millisecond sample stays valid.
                     int rtt = (int) Math.min(Integer.MAX_VALUE, (info.getRTT() + 999) / 1000);
                     if (isCurrent(generation))
                     {
-                        detector.tcpSample(target.request, target.fd, rtt, info.getTransmitted(), info.getRetransmitted(), now());
+                        detector.tcpSample(target.request, target.socketIdentity, rtt, info.getTransmitted(), info.getRetransmitted(), now());
                     }
                     failures = 0;
                     return;
@@ -335,7 +344,7 @@ public class LagAlarmPlugin extends Plugin
             {
                 log.debug("Game socket statistics unavailable; tick and ICMP checks remain active", ex);
             }
-            if (isCurrent(generation)) { detector.tcpUnavailable(target.request, target.fd); }
+            if (isCurrent(generation)) { detector.tcpUnavailable(target.request, target.socketIdentity); }
             failures = Math.min(6, failures + 1);
             retryAt = now() + Math.min(30000, 1000L << (failures - 1));
         }
