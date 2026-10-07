@@ -157,7 +157,7 @@ public class LagAlarmPlugin extends Plugin
                     var fd = client.getSocketFD();
                     LagDetector.Probe request = detector.observeSocket(fd);
                     socketTarget = fd == null || request == null ? null
-                        : new SocketTarget(fd, request, () -> fd.valid() ? Ping.getTCPInfo(fd) : null);
+                        : new SocketTarget(fd, request, () -> Ping.getTCPInfo(fd));
                     socketCaptureFailures = 0;
                 }
                 catch (RuntimeException | LinkageError ex)
