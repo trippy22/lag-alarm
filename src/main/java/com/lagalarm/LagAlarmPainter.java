@@ -21,9 +21,15 @@ final class LagAlarmPainter
     static void paint(Graphics2D original, int width, int height, Rectangle chatbox, LagDetector.Snapshot snapshot,
         Color color, boolean pulse, long now)
     {
-        if (width < 140 || height < 140 || snapshot.mode == LagDetector.Mode.IDLE || !snapshot.hasWarning()) { return; }
+        if (width < 140 || height < 140 || snapshot.mode == LagDetector.Mode.IDLE || !snapshot.hasWarning())
+        {
+            return;
+        }
         Rectangle bounds = warningBounds(width, height, chatbox);
-        if (bounds == null) { return; }
+        if (bounds == null)
+        {
+            return;
+        }
         int x = bounds.x;
         int y = bounds.y;
         int w = bounds.width;
@@ -74,13 +80,19 @@ final class LagAlarmPainter
                 : "WORLD " + snapshot.world + "  |  Waiting for stable connection and updates";
             centered(g, footer, x, y + 81, w);
         }
-        finally { g.dispose(); }
+        finally
+        {
+            g.dispose();
+        }
     }
 
     static Rectangle warningBounds(int width, int height, Rectangle chatbox)
     {
         Rectangle visibleChat = chatbox == null ? null : chatbox.intersection(new Rectangle(0, 0, width, height));
-        if (visibleChat == null || visibleChat.width < 140 || visibleChat.height < 20) { return null; }
+        if (visibleChat == null || visibleChat.width < 140 || visibleChat.height < 20)
+        {
+            return null;
+        }
         int verticalMargin = visibleChat.height >= 116 ? 8 : 2;
         int w = Math.min(510, visibleChat.width - 16);
         int h = Math.min(100, visibleChat.height - 2 * verticalMargin);
@@ -94,9 +106,15 @@ final class LagAlarmPainter
         Rectangle canvas = new Rectangle(0, 0, width, height);
         for (Rectangle candidate : new Rectangle[] {chatbox, controls})
         {
-            if (candidate == null) { continue; }
+            if (candidate == null)
+            {
+                continue;
+            }
             Rectangle area = candidate.intersection(canvas);
-            if (area.width < 140 || area.height < 20) { continue; }
+            if (area.width < 140 || area.height < 20)
+            {
+                continue;
+            }
             if (area.height < 100)
             {
                 // Collapsed chat retains its bottom controls; restore the usual footprint above them.
@@ -115,15 +133,24 @@ final class LagAlarmPainter
     {
         switch (snapshot.reason)
         {
-            case CLIENT_STALL: return "Local client updates have also paused";
-            case HIGH_PING: return "Sustained high ping - latest " + snapshot.pingMs + " ms";
-            case TCP_LATENCY: return "Game connection latency is high - latest " + snapshot.tcpRttMs + " ms";
-            case TCP_RETRANSMISSIONS: return "Game connection is repeatedly retransmitting data";
-            case PROBE_DELAY: return "Ping reply delayed - connection may be unstable";
-            case PROBE_FAILURES: return "Recent ping probes failed - check connection stability";
-            case RECOVERING: return "Updates resumed - confirming recovery";
-            case TEST: return "Previewing your selected lag alerts";
-            default: return String.format(Locale.ROOT, "No game update for %.1f seconds", snapshot.tickAgeMs / 1000.0);
+            case CLIENT_STALL:
+                return "Local client updates have also paused";
+            case HIGH_PING:
+                return "Sustained high ping - latest " + snapshot.pingMs + " ms";
+            case TCP_LATENCY:
+                return "Game connection latency is high - latest " + snapshot.tcpRttMs + " ms";
+            case TCP_RETRANSMISSIONS:
+                return "Game connection is repeatedly retransmitting data";
+            case PROBE_DELAY:
+                return "Ping reply delayed - connection may be unstable";
+            case PROBE_FAILURES:
+                return "Recent ping probes failed - check connection stability";
+            case RECOVERING:
+                return "Updates resumed - confirming recovery";
+            case TEST:
+                return "Previewing your selected lag alerts";
+            default:
+                return String.format(Locale.ROOT, "No game update for %.1f seconds", snapshot.tickAgeMs / 1000.0);
         }
     }
 

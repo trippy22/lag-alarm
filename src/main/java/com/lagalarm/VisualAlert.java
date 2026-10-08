@@ -8,8 +8,14 @@ public enum VisualAlert
 
     private final String label;
 
-    VisualAlert(String label) { this.label = label; }
+    VisualAlert(String label)
+    {
+        this.label = label;
+    }
 
     @Override
-    public String toString() { return label; }
+    public String toString()
+    {
+        return label;
+    }
 }

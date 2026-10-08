@@ -3,7 +3,7 @@ package com.lagalarm;
 import java.util.Arrays;
 
 /** Robust per-world latency baseline and bounded retry policy. Called under the detector lock. */
-final class PingBaseline
+final class LatencyBaseline
 {
     private final int[] values = new int[61];
     private final int[] scratch = new int[61];
@@ -37,7 +37,10 @@ final class PingBaseline
 
     void record(int rtt, boolean gameUpdatesHealthy, long now)
     {
-        if (burstRemaining > 0) { burstRemaining--; }
+        if (burstRemaining > 0)
+        {
+            burstRemaining--;
+        }
         if (rtt < 0)
         {
             pauseLearning();
@@ -60,7 +63,10 @@ final class PingBaseline
             burstRemaining = 8;
             nextBurstAllowed = now + 30000;
         }
-        if (!gameUpdatesHealthy || (lastSample >= 0 && now - lastSample > 2500)) { pauseLearning(); }
+        if (!gameUpdatesHealthy || (lastSample >= 0 && now - lastSample > 2500))
+        {
+            pauseLearning();
+        }
         lastSample = now;
         if (gameUpdatesHealthy)
         {
@@ -70,7 +76,10 @@ final class PingBaseline
             System.arraycopy(values, 0, scratch, 0, count);
             Arrays.sort(scratch, 0, count);
             median = scratch[count / 2];
-            for (int i = 0; i < count; i++) { scratch[i] = Math.abs(values[i] - median); }
+            for (int i = 0; i < count; i++)
+            {
+                scratch[i] = Math.abs(values[i] - median);
+            }
             Arrays.sort(scratch, 0, count);
             deviation = scratch[count / 2];
         }
@@ -92,8 +101,15 @@ final class PingBaseline
         }
     }
 
-    boolean isAvailable() { return available; }
-    int normalPing() { return count == 0 ? -1 : reference < 0 ? median : reference; }
+    boolean isAvailable()
+    {
+        return available;
+    }
+
+    int normalPing()
+    {
+        return count == 0 ? -1 : reference < 0 ? median : reference;
+    }
 
     int highThreshold()
     {
@@ -117,10 +133,16 @@ final class PingBaseline
 
     private void considerStableRoute(long now)
     {
-        if (count < 15) { return; }
+        if (count < 15)
+        {
+            return;
+        }
         // A short window tests stability; its level must also stay near one fixed candidate
         // for two minutes. A moving window alone would quietly accept a slow upward ramp.
-        for (int i = 0; i < 15; i++) { scratch[i] = values[(cursor - 1 - i + values.length) % values.length]; }
+        for (int i = 0; i < 15; i++)
+        {
+            scratch[i] = values[(cursor - 1 - i + values.length) % values.length];
+        }
         Arrays.sort(scratch, 0, 15);
         int recent = scratch[7];
         int tolerance = Math.max(20, recent / 10);
@@ -145,14 +167,23 @@ final class PingBaseline
 
     int retryDelay()
     {
-        if (consecutiveFailures == 0) { return burstRemaining > 0 ? 250 : 1000; }
+        if (consecutiveFailures == 0)
+        {
+            return burstRemaining > 0 ? 250 : 1000;
+        }
         return Math.min(30000, 1000 << Math.min(5, consecutiveFailures - 1));
     }
 
     String status()
     {
-        if (available) { return "Active"; }
-        if (consecutiveFailures > 0) { return "Ping unavailable; retrying"; }
+        if (available)
+        {
+            return "Active";
+        }
+        if (consecutiveFailures > 0)
+        {
+            return "Ping unavailable; retrying";
+        }
         return "Learning ping " + Math.min(count, consecutiveSuccesses) + "/5";
     }
 }

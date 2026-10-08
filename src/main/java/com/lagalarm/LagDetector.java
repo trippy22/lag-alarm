@@ -3,10 +3,42 @@ package com.lagalarm;
 /** Thread-safe, constant-space detector. All times are monotonic milliseconds. No RuneLite or I/O dependency. */
 final class LagDetector
 {
-    enum Mode { IDLE, MONITORING, LOADING }
-    enum Reason { NONE, TICK_STALL, CLIENT_STALL, HIGH_PING, TCP_LATENCY, TCP_RETRANSMISSIONS,
-        PROBE_DELAY, PROBE_FAILURES, RECOVERING, TEST }
-    enum Confidence { NONE, CAUTION, ALARM }
+    private static final int GAME_TICK_LATE_MS = 900;
+    private static final int CLIENT_TICK_STALE_MS = 500;
+    private static final int MIN_HEALTHY_TICK_INTERVAL_MS = 300;
+    private static final int MAX_HEALTHY_TICK_INTERVAL_MS = 1000;
+    private static final int ICMP_SAMPLE_MAX_AGE_MS = 5000;
+    private static final int ICMP_COMPLETION_MAX_AGE_MS = 10000;
+    private static final int ICMP_HISTORY_MAX_AGE_MS = 30000;
+    private static final int TEST_ALERT_DURATION_MS = 5000;
+
+    enum Mode
+    {
+        IDLE,
+        MONITORING,
+        LOADING
+    }
+
+    enum Reason
+    {
+        NONE,
+        TICK_STALL,
+        CLIENT_STALL,
+        HIGH_PING,
+        TCP_LATENCY,
+        TCP_RETRANSMISSIONS,
+        PROBE_DELAY,
+        PROBE_FAILURES,
+        RECOVERING,
+        TEST
+    }
+
+    enum Confidence
+    {
+        NONE,
+        CAUTION,
+        ALARM
+    }
 
     static final class Settings
     {
@@ -56,11 +88,17 @@ final class LagDetector
         }
     }
 
-    static final class Probe
+    /** Identifies a measurement's world and generation; creating a token sends no network request. */
+    static final class ConnectionToken
     {
         final long generation;
         final int world;
-        Probe(long generation, int world) { this.generation = generation; this.world = world; }
+
+        ConnectionToken(long generation, int world)
+        {
+            this.generation = generation;
+            this.world = world;
+        }
     }
 
     static final class Snapshot
@@ -94,8 +132,14 @@ final class LagDetector
             this.confidence = confidence;
         }
 
-        boolean isAlarm() { return confidence == Confidence.ALARM; }
-        boolean hasWarning() { return reason != Reason.NONE; }
+        boolean isAlarm()
+        {
+            return confidence == Confidence.ALARM;
+        }
+        boolean hasWarning()
+        {
+            return reason != Reason.NONE;
+        }
     }
 
     private Settings settings = new Settings(1500, 3000, 3000, false, 400);
@@ -115,7 +159,7 @@ final class LagDetector
     private int healthyTicks;
     private long testUntil;
     private boolean testing;
-    private Probe pendingProbe;
+    private ConnectionToken pendingProbe;
     private long probeStarted;
     private int successes;
     private final boolean[] failedProbes = new boolean[100];
@@ -126,7 +170,7 @@ final class LagDetector
     private long lastProbeCompleted;
     private long lastClientTick;
     private boolean haveClientTick;
-    private final PingBaseline baseline = new PingBaseline();
+    private final LatencyBaseline baseline = new LatencyBaseline();
     private final TcpHealth tcp = new TcpHealth();
     private Object socketIdentity;
 
@@ -206,7 +250,10 @@ final class LagDetector
 
     synchronized void tick(long now)
     {
-        if (mode == Mode.IDLE) { return; }
+        if (mode == Mode.IDLE)
+        {
+            return;
+        }
         long gap = now - lastTick;
         // Catch a long gap even if the watchdog itself was paused by a JVM stall.
         if (haveTick && mode == Mode.MONITORING && now >= suppressUntil && gap >= settings.stallMs)
@@ -215,7 +262,8 @@ final class LagDetector
             healthyTicks = 0;
         }
         // Bursts of queued ticks are not evidence that live updates have stabilized.
-        boolean normalInterval = haveTick && gap >= 300 && gap < Math.min(1000, settings.stallMs);
+        boolean normalInterval = haveTick && gap >= MIN_HEALTHY_TICK_INTERVAL_MS
+            && gap < Math.min(MAX_HEALTHY_TICK_INTERVAL_MS, settings.stallMs);
         healthyTicks = normalInterval ? Math.min(2, healthyTicks + 1) : 0;
         haveTick = true;
         lastTick = now;
@@ -224,12 +272,19 @@ final class LagDetector
 
     synchronized void clientTick(long now)
     {
-        if (mode != Mode.IDLE) { lastClientTick = now; haveClientTick = true; }
+        if (mode != Mode.IDLE)
+        {
+            lastClientTick = now;
+            haveClientTick = true;
+        }
     }
 
-    synchronized Probe observeSocket(Object identity)
+    synchronized ConnectionToken trackSocketIdentity(Object identity)
     {
-        if (mode != Mode.MONITORING) { return null; }
+        if (mode != Mode.MONITORING)
+        {
+            return null;
+        }
         if (socketIdentity != identity)
         {
             boolean replacing = socketIdentity != null;
@@ -242,52 +297,67 @@ final class LagDetector
                 resetProbes();
             }
         }
-        return probe();
+        return currentConnection();
     }
 
-    synchronized void tcpSample(Probe request, Object identity, int rtt, long transmitted, long retransmitted, long now)
+    synchronized void recordTcpSample(ConnectionToken connection, Object identity, int rtt,
+        long transmitted, long retransmitted, long now)
     {
-        if (!currentSocket(request, identity)) { return; }
+        if (!currentSocket(connection, identity))
+        {
+            return;
+        }
         tcp.record(rtt, transmitted, retransmitted, gameUpdatesHealthy(now), now);
     }
 
-    synchronized void tcpUnavailable(Probe request, Object identity)
+    synchronized void markTcpUnavailable(ConnectionToken connection, Object identity)
     {
-        if (currentSocket(request, identity)) { tcp.suspend(); }
+        if (currentSocket(connection, identity))
+        {
+            tcp.suspend();
+        }
     }
 
-    private boolean currentSocket(Probe request, Object identity)
+    private boolean currentSocket(ConnectionToken connection, Object identity)
     {
-        return mode == Mode.MONITORING && request != null && request.generation == generation
-            && request.world == world && identity != null && identity == socketIdentity;
+        // State resets cannot cancel a native query already in progress. Discard its late result here.
+        return mode == Mode.MONITORING && connection != null && connection.generation == generation
+            && connection.world == world && identity != null && identity == socketIdentity;
     }
 
     private boolean gameUpdatesHealthy(long now)
     {
-        return haveTick && now - lastTick < 900 && (!haveClientTick || now - lastClientTick < 500);
+        return haveTick && now - lastTick < GAME_TICK_LATE_MS
+            && (!haveClientTick || now - lastClientTick < CLIENT_TICK_STALE_MS);
     }
 
-    synchronized Probe probe()
+    synchronized ConnectionToken currentConnection()
     {
-        return settings.pingEnabled && mode == Mode.MONITORING ? new Probe(generation, world) : null;
+        return settings.pingEnabled && mode == Mode.MONITORING ? new ConnectionToken(generation, world) : null;
     }
 
-    synchronized boolean beginProbe(Probe probe, long now)
+    synchronized boolean beginIcmpProbe(ConnectionToken connection, long now)
     {
-        if (probe == null || probe.generation != generation || mode != Mode.MONITORING || pendingProbe != null)
+        if (connection == null || connection.generation != generation || mode != Mode.MONITORING || pendingProbe != null)
         {
             return false;
         }
-        pendingProbe = probe;
+        pendingProbe = connection;
         probeStarted = now;
         return true;
     }
 
-    synchronized void ping(Probe probe, int result, long now)
+    synchronized void recordIcmpSample(ConnectionToken connection, int result, long now)
     {
-        if (probe == null || probe.generation != generation || probe.world != world
-            || !settings.pingEnabled || mode != Mode.MONITORING) { return; }
-        if (pendingProbe != null && pendingProbe != probe) { return; }
+        if (connection == null || connection.generation != generation || connection.world != world
+            || !settings.pingEnabled || mode != Mode.MONITORING)
+        {
+            return;
+        }
+        if (pendingProbe != null && pendingProbe != connection)
+        {
+            return;
+        }
         pendingProbe = null;
         lastProbeCompleted = now;
         if (settings.adaptive)
@@ -300,10 +370,16 @@ final class LagDetector
                 sampleCount = sampleCursor = failures = 0;
             }
         }
-        if (result >= 0) { successes = Math.min(3, successes + 1); }
+        if (result >= 0)
+        {
+            successes = Math.min(3, successes + 1);
+        }
         recordProbe(result < 0, now);
         // Old evidence must not combine with a sample that arrived much later.
-        if (now - lastPing > 5000) { clearPing(); }
+        if (now - lastPing > ICMP_SAMPLE_MAX_AGE_MS)
+        {
+            clearPing();
+        }
         lastPing = now;
         pingMs = result;
         if (result < 0)
@@ -315,24 +391,37 @@ final class LagDetector
         {
             healthyPings = 0;
             highPings = Math.min(settings.highPingSamples, highPings + 1);
-            if (highPings >= settings.highPingSamples) { pingAlarm = true; }
+            if (highPings >= settings.highPingSamples)
+            {
+                pingAlarm = true;
+            }
         }
         else
         {
             highPings = 0;
             healthyPings = Math.min(2, healthyPings + 1);
-            if (healthyPings >= 2) { pingAlarm = false; }
+            if (healthyPings >= 2)
+            {
+                pingAlarm = false;
+            }
         }
     }
 
     synchronized void test(long now)
     {
-        if (mode != Mode.IDLE) { testing = true; testUntil = now + 5000; }
+        if (mode != Mode.IDLE)
+        {
+            testing = true;
+            testUntil = now + TEST_ALERT_DURATION_MS;
+        }
     }
 
     synchronized Snapshot evaluate(long now)
     {
-        if (pingMs >= 0 && now - lastPing > 5000) { clearPing(); }
+        if (pingMs >= 0 && now - lastPing > ICMP_SAMPLE_MAX_AGE_MS)
+        {
+            clearPing();
+        }
         long age = mode == Mode.IDLE ? 0 : Math.max(0, now - lastTick);
         boolean grace = mode != Mode.IDLE && now < suppressUntil;
         Reason reason = Reason.NONE;
@@ -341,12 +430,22 @@ final class LagDetector
         {
             if (age >= settings.stallMs && (mode != Mode.LOADING || now >= loadingUntil))
             {
-                reason = haveClientTick && now - lastClientTick >= 500 ? Reason.CLIENT_STALL : Reason.TICK_STALL;
+                reason = haveClientTick && now - lastClientTick >= CLIENT_TICK_STALE_MS
+                    ? Reason.CLIENT_STALL : Reason.TICK_STALL;
             }
-            else if (mode == Mode.MONITORING && settings.adaptive && tcp.repeatedRetries(now)) { reason = Reason.TCP_RETRANSMISSIONS; }
-            else if (mode == Mode.MONITORING && settings.adaptive && tcp.highLatency(now)) { reason = Reason.TCP_LATENCY; }
+            else if (mode == Mode.MONITORING && settings.adaptive && tcp.repeatedRetries(now))
+            {
+                reason = Reason.TCP_RETRANSMISSIONS;
+            }
+            else if (mode == Mode.MONITORING && settings.adaptive && tcp.highLatency(now))
+            {
+                reason = Reason.TCP_LATENCY;
+            }
             else if (mode == Mode.MONITORING && pingAlarm
-                && (!settings.adaptive || baseline.isAvailable() || pingMs >= 1000)) { reason = Reason.HIGH_PING; }
+                && (!settings.adaptive || baseline.isAvailable() || pingMs >= 1000))
+            {
+                reason = Reason.HIGH_PING;
+            }
             else if (settings.pingEnabled && (settings.adaptive ? baseline.isAvailable() : successes >= 3))
             {
                 int deadline = settings.adaptive ? baseline.deadline() : settings.probeDeadlineMs;
@@ -354,8 +453,8 @@ final class LagDetector
                 {
                     reason = Reason.PROBE_DELAY;
                 }
-                else if (sampleCount == settings.failureWindow && now - lastProbeCompleted <= 10000
-                    && now - probeTimes[sampleCursor] <= 30000
+                else if (sampleCount == settings.failureWindow && now - lastProbeCompleted <= ICMP_COMPLETION_MAX_AGE_MS
+                    && now - probeTimes[sampleCursor] <= ICMP_HISTORY_MAX_AGE_MS
                     && failures * 100 >= settings.failurePercent * sampleCount)
                 {
                     reason = Reason.PROBE_FAILURES;
@@ -368,7 +467,9 @@ final class LagDetector
             if (settings.adaptive)
             {
                 boolean probeOnly = reason == Reason.PROBE_DELAY || reason == Reason.PROBE_FAILURES;
-                boolean gameLate = haveTick && age >= 900;
+                boolean gameLate = haveTick && age >= GAME_TICK_LATE_MS;
+                // ICMP alone is weaker evidence: require late game updates for failed/delayed probes,
+                // and keep high ICMP latency silent while fresh TCP evidence and game updates are healthy.
                 if ((probeOnly && !gameLate)
                     || (reason == Reason.HIGH_PING && tcp.healthy(now) && gameUpdatesHealthy(now)))
                 {
@@ -383,11 +484,25 @@ final class LagDetector
         }
         else if (alarm)
         {
-            if (healthyTicks >= 2) { alarm = false; }
-            else { reason = Reason.RECOVERING; confidence = Confidence.ALARM; }
+            if (healthyTicks >= 2)
+            {
+                alarm = false;
+            }
+            else
+            {
+                reason = Reason.RECOVERING;
+                confidence = Confidence.ALARM;
+            }
         }
-        if (testing && now >= testUntil) { testing = false; }
-        if (confidence != Confidence.ALARM && testing) { reason = Reason.TEST; confidence = Confidence.ALARM; }
+        if (testing && now >= testUntil)
+        {
+            testing = false;
+        }
+        if (confidence != Confidence.ALARM && testing)
+        {
+            reason = Reason.TEST;
+            confidence = Confidence.ALARM;
+        }
         Snapshot snapshot = new Snapshot(mode, reason, world, age, pingMs, grace, confidence);
         snapshot.tcpRttMs = tcp.rtt();
         snapshot.pingStatus = settings.adaptive ? baseline.status() : "Fixed thresholds";
@@ -396,7 +511,10 @@ final class LagDetector
         return snapshot;
     }
 
-    synchronized int probeDelay() { return settings.adaptive ? baseline.retryDelay() : 500; }
+    synchronized int icmpProbeDelay()
+    {
+        return settings.adaptive ? baseline.retryDelay() : 500;
+    }
 
     private void clearPing()
     {
@@ -425,12 +543,21 @@ final class LagDetector
     {
         if (sampleCount == settings.failureWindow)
         {
-            if (failedProbes[sampleCursor]) { failures--; }
+            if (failedProbes[sampleCursor])
+            {
+                failures--;
+            }
         }
-        else { sampleCount++; }
+        else
+        {
+            sampleCount++;
+        }
         failedProbes[sampleCursor] = failed;
         probeTimes[sampleCursor] = now;
-        if (failed) { failures++; }
+        if (failed)
+        {
+            failures++;
+        }
         sampleCursor = (sampleCursor + 1) % settings.failureWindow;
     }
 }

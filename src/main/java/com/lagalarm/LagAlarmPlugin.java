@@ -1,20 +1,18 @@
 package com.lagalarm;
 
 import com.google.inject.Provides;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
-import net.runelite.api.events.ClientTick;
 import net.runelite.client.audio.AudioPlayer;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -25,12 +23,8 @@ import net.runelite.client.game.WorldService;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.worldhopper.ping.Ping;
-import net.runelite.client.plugins.worldhopper.ping.TCPInfo;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.HotkeyListener;
-import net.runelite.http.api.worlds.World;
-import net.runelite.http.api.worlds.WorldResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,15 +34,34 @@ import org.slf4j.LoggerFactory;
 public class LagAlarmPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(LagAlarmPlugin.class);
-    @Inject private Client client;
-    @Inject private ClientThread clientThread;
-    @Inject private LagAlarmConfig config;
-    @Inject private ConfigManager configManager;
-    @Inject private OverlayManager overlayManager;
-    @Inject private LagAlarmOverlay overlay;
-    @Inject private WorldService worldService;
-    @Inject private AudioPlayer audioPlayer;
-    @Inject private KeyManager keyManager;
+    private static final int WATCHDOG_INTERVAL_MS = 25;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private LagAlarmConfig config;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private LagAlarmOverlay overlay;
+
+    @Inject
+    private WorldService worldService;
+
+    @Inject
+    private AudioPlayer audioPlayer;
+
+    @Inject
+    private KeyManager keyManager;
 
     private final LagDetector detector = new LagDetector();
     private volatile LagDetector.Snapshot snapshot = detector.evaluate(0);
@@ -56,27 +69,29 @@ public class LagAlarmPlugin extends Plugin
     private volatile long runGeneration;
     private volatile SoundSettings soundSettings = new SoundSettings(true, 60, 4);
     private ScheduledExecutorService workers;
-    private ScheduledFuture<?> watchdogFuture;
-    private ScheduledFuture<?> pingFuture;
-    private ScheduledFuture<?> tcpFuture;
-    private volatile SocketTarget socketTarget;
-    private long nextSocketCapture;
-    private int socketCaptureFailures;
+    private GameSocketMonitor socketMonitor;
+    private IcmpMonitor icmpMonitor;
     private final AtomicBoolean soundPending = new AtomicBoolean();
     private long lastSound;
     private boolean previouslyAlarmed;
-    private final ProbePacer probePacer = new ProbePacer();
 
     private final HotkeyListener testKey = new HotkeyListener(() -> new Keybind(KeyEvent.VK_F10, InputEvent.SHIFT_DOWN_MASK))
     {
-        @Override public void hotkeyPressed()
+        @Override
+        public void hotkeyPressed()
         {
-            if (running) { detector.test(now()); }
+            if (running)
+            {
+                detector.test(now());
+            }
         }
     };
 
     @Provides
-    LagAlarmConfig provideConfig(ConfigManager manager) { return manager.getConfig(LagAlarmConfig.class); }
+    LagAlarmConfig provideConfig(ConfigManager manager)
+    {
+        return manager.getConfig(LagAlarmConfig.class);
+    }
 
     @Override
     protected void startUp()
@@ -85,12 +100,13 @@ public class LagAlarmPlugin extends Plugin
         migrateAlertPreference();
         refreshSettings();
         previouslyAlarmed = false;
-        probePacer.reset();
         soundPending.set(false);
-        socketTarget = null;
-        nextSocketCapture = 0;
-        socketCaptureFailures = 0;
         long generation = ++runGeneration;
+        // Scheduled tasks retain these instances, so an old run cannot poll a replacement monitor.
+        GameSocketMonitor sockets = new GameSocketMonitor(client, detector);
+        IcmpMonitor icmp = new IcmpMonitor(worldService, detector);
+        socketMonitor = sockets;
+        icmpMonitor = icmp;
         running = true;
         // Keep native socket queries, ICMP and audio off both the client thread and the watchdog.
         ScheduledExecutorService executor = Executors.newScheduledThreadPool(4, runnable ->
@@ -104,13 +120,18 @@ public class LagAlarmPlugin extends Plugin
         keyManager.registerKeyListener(testKey);
         clientThread.invokeLater(() ->
         {
-            if (isCurrent(generation)) { updateState(client.getGameState()); }
+            if (isCurrent(generation))
+            {
+                updateState(client.getGameState());
+            }
         });
-        watchdogFuture = executor.scheduleWithFixedDelay(() -> watch(generation, executor), 0, 25, TimeUnit.MILLISECONDS);
+        executor.scheduleWithFixedDelay(() -> checkForLag(generation, executor),
+            0, WATCHDOG_INTERVAL_MS, TimeUnit.MILLISECONDS);
         // Fixed delay avoids backlogs or overlapping probes when ICMP times out.
-        pingFuture = executor.scheduleWithFixedDelay(() -> probe(generation), 25, 25, TimeUnit.MILLISECONDS);
-        TcpPoller tcpPoller = new TcpPoller();
-        tcpFuture = executor.scheduleWithFixedDelay(() -> tcpPoller.poll(generation), 250, 250, TimeUnit.MILLISECONDS);
+        executor.scheduleWithFixedDelay(icmp::probeCurrentWorld, IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS,
+            IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        executor.scheduleWithFixedDelay(sockets::pollSocketStatistics, GameSocketMonitor.POLL_INTERVAL_MS,
+            GameSocketMonitor.POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -118,11 +139,22 @@ public class LagAlarmPlugin extends Plugin
     {
         running = false;
         runGeneration++;
-        if (watchdogFuture != null) { watchdogFuture.cancel(true); watchdogFuture = null; }
-        if (pingFuture != null) { pingFuture.cancel(true); pingFuture = null; }
-        if (tcpFuture != null) { tcpFuture.cancel(true); tcpFuture = null; }
-        socketTarget = null;
-        if (workers != null) { workers.shutdownNow(); workers = null; }
+        if (socketMonitor != null)
+        {
+            socketMonitor.stop();
+            socketMonitor = null;
+        }
+        if (icmpMonitor != null)
+        {
+            icmpMonitor.stop();
+            icmpMonitor = null;
+        }
+        // This executor belongs only to this plugin run; stop all scheduled tasks together.
+        if (workers != null)
+        {
+            workers.shutdownNow();
+            workers = null;
+        }
         keyManager.unregisterKeyListener(testKey);
         overlayManager.remove(overlay);
         detector.stop();
@@ -142,55 +174,48 @@ public class LagAlarmPlugin extends Plugin
     @Subscribe
     public void onClientTick(ClientTick event)
     {
-        if (!running) { return; }
+        GameSocketMonitor sockets = socketMonitor;
+        if (!running || sockets == null)
+        {
+            return;
+        }
         long time = now();
         detector.clientTick(time);
-        if (time >= nextSocketCapture)
-        {
-            nextSocketCapture = time + 250;
-            // Client APIs stay on the client thread; only the immutable target crosses threads.
-            if (client.getGameState() == GameState.LOGGED_IN)
-            {
-                try
-                {
-                    // RuneLite's live game-socket handle for Ping.getTCPInfo(), not a filesystem path.
-                    var fd = client.getSocketFD();
-                    LagDetector.Probe request = detector.observeSocket(fd);
-                    socketTarget = fd == null || request == null ? null
-                        : new SocketTarget(fd, request, () -> Ping.getTCPInfo(fd));
-                    socketCaptureFailures = 0;
-                }
-                catch (RuntimeException | LinkageError ex)
-                {
-                    SocketTarget previous = socketTarget;
-                    socketTarget = null;
-                    if (previous != null) { detector.tcpUnavailable(previous.request, previous.socketIdentity); }
-                    socketCaptureFailures = Math.min(6, socketCaptureFailures + 1);
-                    nextSocketCapture = time + Math.min(30000, 1000L << (socketCaptureFailures - 1));
-                    log.debug("Game socket unavailable; tick and ICMP checks remain active", ex);
-                }
-            }
-            else { socketTarget = null; }
-        }
+        sockets.captureSocket(time);
     }
 
     @Subscribe
     public void onGameStateChanged(GameStateChanged event)
     {
-        if (running) { updateState(event.getGameState()); }
+        if (running)
+        {
+            updateState(event.getGameState());
+        }
     }
 
     private void updateState(GameState state)
     {
-        if (state != GameState.LOGGED_IN) { socketTarget = null; }
-        nextSocketCapture = 0;
+        GameSocketMonitor sockets = socketMonitor;
+        if (!running || sockets == null)
+        {
+            return;
+        }
+        sockets.onGameStateChanged(state);
         switch (state)
         {
-            case LOGGED_IN: detector.loggedIn(client.getWorld(), now()); break;
-            case LOADING: detector.loading(now()); break;
-            case CONNECTION_LOST: detector.connectionLost(); break;
+            case LOGGED_IN:
+                detector.loggedIn(client.getWorld(), now());
+                break;
+            case LOADING:
+                detector.loading(now());
+                break;
+            case CONNECTION_LOST:
+                detector.connectionLost();
+                break;
             // Includes intentional hops, logout, and fresh login attempts.
-            default: detector.stop(); break;
+            default:
+                detector.stop();
+                break;
         }
         snapshot = detector.evaluate(now());
     }
@@ -198,7 +223,10 @@ public class LagAlarmPlugin extends Plugin
     @Subscribe
     public void onConfigChanged(ConfigChanged event)
     {
-        if (LagAlarmConfig.GROUP.equals(event.getGroup())) { refreshSettings(); }
+        if (LagAlarmConfig.GROUP.equals(event.getGroup()))
+        {
+            refreshSettings();
+        }
     }
 
     private void refreshSettings()
@@ -217,14 +245,20 @@ public class LagAlarmPlugin extends Plugin
         }
     }
 
-    private void watch(long generation, ScheduledExecutorService executor)
+    private void checkForLag(long generation, ScheduledExecutorService executor)
     {
         try
         {
-            if (!isCurrent(generation)) { return; }
+            if (!isCurrent(generation))
+            {
+                return;
+            }
             long time = now();
             LagDetector.Snapshot next = detector.evaluate(time);
-            if (!isCurrent(generation)) { return; }
+            if (!isCurrent(generation))
+            {
+                return;
+            }
             snapshot = next;
             SoundSettings sound = soundSettings;
             if (next.isAlarm() && sound.enabled
@@ -241,8 +275,14 @@ public class LagAlarmPlugin extends Plugin
                             audioPlayer.play(LagAlarmPlugin.class, "lag-voice.wav", sound.gain);
                         }
                     }
-                    catch (Exception ex) { log.debug("Unable to play spoken lag alert", ex); }
-                    finally { soundPending.set(false); }
+                    catch (Exception ex)
+                    {
+                        log.debug("Unable to play spoken lag alert", ex);
+                    }
+                    finally
+                    {
+                        soundPending.set(false);
+                    }
                 });
             }
             previouslyAlarmed = next.isAlarm();
@@ -254,100 +294,19 @@ public class LagAlarmPlugin extends Plugin
         }
     }
 
-    private void probe(long generation)
+    private boolean isCurrent(long generation)
     {
-        LagDetector.Probe request = null;
-        boolean started = false;
-        try
-        {
-            if (!isCurrent(generation)) { return; }
-            request = detector.probe();
-            if (request == null) { return; }
-            if (!probePacer.ready(request, now())) { return; }
-            WorldResult worlds = worldService.getWorlds();
-            World world = worlds == null ? null : worlds.findWorld(request.world);
-            if (world == null) { return; }
-            if (!detector.beginProbe(request, now())) { return; }
-            started = true;
-            // Reuse the World Hopper helper, without depending on World Hopper being enabled.
-            // No TCP fallback on Windows/macOS/Linux: failed ICMP is an unknown measurement.
-            int result = Ping.ping(world, false);
-            if (isCurrent(generation)) { detector.ping(request, result, now()); }
-        }
-        catch (RuntimeException | LinkageError ex)
-        {
-            if (started && isCurrent(generation)) { detector.ping(request, -1, now()); }
-            log.debug("Ping unavailable; passive tick monitoring remains active", ex);
-        }
-        finally
-        {
-            if (started && isCurrent(generation))
-            {
-                probePacer.finished(request, now(), detector.probeDelay());
-            }
-        }
+        return running && generation == runGeneration;
     }
 
-    private boolean isCurrent(long generation) { return running && generation == runGeneration; }
-    LagDetector.Snapshot getSnapshot() { return snapshot; }
-    static long now() { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime()); }
-
-    private static final class SocketTarget
+    LagDetector.Snapshot getSnapshot()
     {
-        final Object socketIdentity;
-        final LagDetector.Probe request;
-        final Supplier<TCPInfo> readTcpInfo;
-
-        SocketTarget(Object socketIdentity, LagDetector.Probe request, Supplier<TCPInfo> readTcpInfo)
-        {
-            this.socketIdentity = socketIdentity;
-            this.request = request;
-            this.readTcpInfo = readTcpInfo;
-        }
+        return snapshot;
     }
 
-    private final class TcpPoller
+    static long now()
     {
-        private SocketTarget previous;
-        private long retryAt;
-        private int failures;
-
-        void poll(long generation)
-        {
-            if (!isCurrent(generation)) { return; }
-            SocketTarget target = socketTarget;
-            if (target == null) { return; }
-            if (previous == null || previous.socketIdentity != target.socketIdentity
-                || previous.request.generation != target.request.generation)
-            {
-                previous = target;
-                failures = 0;
-                retryAt = 0;
-            }
-            if (now() < retryAt) { return; }
-            try
-            {
-                TCPInfo info = target.readTcpInfo.get();
-                if (info != null && info.getRTT() > 0 && info.getTransmitted() >= 0 && info.getRetransmitted() >= 0)
-                {
-                    // Native RTT is microseconds. Round up so a valid sub-millisecond sample stays valid.
-                    int rtt = (int) Math.min(Integer.MAX_VALUE, (info.getRTT() + 999) / 1000);
-                    if (isCurrent(generation))
-                    {
-                        detector.tcpSample(target.request, target.socketIdentity, rtt, info.getTransmitted(), info.getRetransmitted(), now());
-                    }
-                    failures = 0;
-                    return;
-                }
-            }
-            catch (RuntimeException | LinkageError ex)
-            {
-                log.debug("Game socket statistics unavailable; tick and ICMP checks remain active", ex);
-            }
-            if (isCurrent(generation)) { detector.tcpUnavailable(target.request, target.socketIdentity); }
-            failures = Math.min(6, failures + 1);
-            retryAt = now() + Math.min(30000, 1000L << (failures - 1));
-        }
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime());
     }
 
     private static final class SoundSettings
@@ -355,6 +314,7 @@ public class LagAlarmPlugin extends Plugin
         final boolean enabled;
         final float gain;
         final long repeatMs;
+
         SoundSettings(boolean enabled, int volume, int repeatSeconds)
         {
             this.enabled = enabled;

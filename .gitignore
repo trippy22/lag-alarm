@@ -27,6 +27,7 @@ Desktop.ini
 /tools/Measure-Capture.ps1
 /work/
 /outputs/
+/src/test/**/*Test.java
 *.etl
 *.pcap
 *.pcapng

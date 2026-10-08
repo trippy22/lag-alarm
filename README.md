@@ -28,13 +28,18 @@ The warning is click-through and stays over the chatbox area in fixed and resiza
 Version **0.2.0**. Requires **JDK 11**.
 
 ```powershell
-.\gradlew.bat test jar
+.\gradlew.bat jar
 .\gradlew.bat run
 ```
 
 The launcher enables assertions (`-ea`). While logged in, press **Shift+F10** for a five-second alert preview. Jagex accounts need RuneLite's [development-client login setup](https://github.com/runelite/runelite/wiki/Using-Jagex-Accounts).
 
-Manual in-game and cross-platform checks are still needed for 0.2.0.
+## Code layout
+
+- `LagAlarmPlugin`: lifecycle, event subscriptions, scheduling and alerts.
+- `GameSocketMonitor`: captures the game socket on the client thread; reads TCP statistics on a worker.
+- `IcmpMonitor`: actively probes the current world using RuneLite's ping helper.
+- `LagDetector`, `TcpHealth`, `LatencyBaseline`: evaluate measurements and decide when to warn.
 
 ## Credits and license
 
