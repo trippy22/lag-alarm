@@ -1,6 +1,7 @@
 package com.lagalarm;
 
 import com.google.inject.Provides;
+import java.awt.Toolkit;
 import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.util.concurrent.Executors;
@@ -68,10 +69,12 @@ public class LagAlarmPlugin extends Plugin
     private volatile boolean running;
     private volatile long runGeneration;
     private volatile SoundSettings soundSettings = new SoundSettings(true, 60, 4);
+    private ScheduledExecutorService watchdog;
     private ScheduledExecutorService workers;
     private GameSocketMonitor socketMonitor;
     private IcmpMonitor icmpMonitor;
     private final AtomicBoolean soundPending = new AtomicBoolean();
+    private volatile boolean audioFailureLogged;
     private long lastSound;
     private boolean previouslyAlarmed;
 
@@ -108,13 +111,14 @@ public class LagAlarmPlugin extends Plugin
         socketMonitor = sockets;
         icmpMonitor = icmp;
         running = true;
-        // Keep native socket queries, ICMP and audio off both the client thread and the watchdog.
-        ScheduledExecutorService executor = Executors.newScheduledThreadPool(4, runnable ->
-        {
-            Thread thread = new Thread(runnable, "lag-alarm-worker");
-            thread.setDaemon(true);
-            return thread;
-        });
+        audioFailureLogged = false;
+        // The watchdog gets its own thread so a slow ping, socket query or audio device can never delay it.
+        ScheduledExecutorService alarmThread = Executors.newSingleThreadScheduledExecutor(runnable ->
+            daemon(runnable, "lag-alarm-watchdog", Thread.MAX_PRIORITY));
+        // One thread each for ICMP, socket statistics and audio; none of these tasks overlap themselves.
+        ScheduledExecutorService executor = Executors.newScheduledThreadPool(3, runnable ->
+            daemon(runnable, "lag-alarm-worker", Thread.NORM_PRIORITY));
+        watchdog = alarmThread;
         workers = executor;
         overlayManager.add(overlay);
         keyManager.registerKeyListener(testKey);
@@ -125,13 +129,14 @@ public class LagAlarmPlugin extends Plugin
                 updateState(client.getGameState());
             }
         });
-        executor.scheduleWithFixedDelay(() -> checkForLag(generation, executor),
+        // A periodic task that throws is cancelled for good, so every task is guarded.
+        alarmThread.scheduleWithFixedDelay(guarded("Lag watchdog check", () -> checkForLag(generation, executor)),
             0, WATCHDOG_INTERVAL_MS, TimeUnit.MILLISECONDS);
         // Fixed delay avoids backlogs or overlapping probes when ICMP times out.
-        executor.scheduleWithFixedDelay(icmp::probeCurrentWorld, IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS,
-            IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
-        executor.scheduleWithFixedDelay(sockets::pollSocketStatistics, GameSocketMonitor.POLL_INTERVAL_MS,
-            GameSocketMonitor.POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        executor.scheduleWithFixedDelay(guarded("Ping probe", icmp::probeCurrentWorld),
+            IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS, IcmpMonitor.SCHEDULE_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        executor.scheduleWithFixedDelay(guarded("Socket statistics poll", sockets::pollSocketStatistics),
+            GameSocketMonitor.POLL_INTERVAL_MS, GameSocketMonitor.POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -149,7 +154,12 @@ public class LagAlarmPlugin extends Plugin
             icmpMonitor.stop();
             icmpMonitor = null;
         }
-        // This executor belongs only to this plugin run; stop all scheduled tasks together.
+        // These executors belong only to this plugin run; stop all scheduled tasks together.
+        if (watchdog != null)
+        {
+            watchdog.shutdownNow();
+            watchdog = null;
+        }
         if (workers != null)
         {
             workers.shutdownNow();
@@ -247,51 +257,89 @@ public class LagAlarmPlugin extends Plugin
 
     private void checkForLag(long generation, ScheduledExecutorService executor)
     {
+        if (!isCurrent(generation))
+        {
+            return;
+        }
+        long time = now();
+        LagDetector.Snapshot next = detector.evaluate(time);
+        if (!isCurrent(generation))
+        {
+            return;
+        }
+        snapshot = next;
+        SoundSettings sound = soundSettings;
+        if (next.isAlarm() && sound.enabled
+            && (!previouslyAlarmed || time - lastSound >= sound.repeatMs)
+            && soundPending.compareAndSet(false, true))
+        {
+            lastSound = time;
+            try
+            {
+                executor.execute(() -> playAlert(generation, sound));
+            }
+            catch (RuntimeException ex)
+            {
+                soundPending.set(false);
+                throw ex;
+            }
+        }
+        previouslyAlarmed = next.isAlarm();
+    }
+
+    private void playAlert(long generation, SoundSettings sound)
+    {
         try
         {
-            if (!isCurrent(generation))
+            if (isCurrent(generation) && detector.evaluate(now()).isAlarm() && soundSettings.enabled)
             {
-                return;
-            }
-            long time = now();
-            LagDetector.Snapshot next = detector.evaluate(time);
-            if (!isCurrent(generation))
-            {
-                return;
-            }
-            snapshot = next;
-            SoundSettings sound = soundSettings;
-            if (next.isAlarm() && sound.enabled
-                && (!previouslyAlarmed || time - lastSound >= sound.repeatMs)
-                && soundPending.compareAndSet(false, true))
-            {
-                lastSound = time;
-                executor.execute(() ->
+                try
                 {
-                    try
+                    audioPlayer.play(LagAlarmPlugin.class, "lag-voice.wav", sound.gain);
+                }
+                catch (Exception | LinkageError ex)
+                {
+                    // A busy or missing audio device must not leave the alarm silent.
+                    Toolkit.getDefaultToolkit().beep();
+                    if (!audioFailureLogged)
                     {
-                        if (isCurrent(generation) && detector.evaluate(now()).isAlarm() && soundSettings.enabled)
-                        {
-                            audioPlayer.play(LagAlarmPlugin.class, "lag-voice.wav", sound.gain);
-                        }
+                        audioFailureLogged = true;
+                        log.warn("Unable to play spoken lag alert; using the system beep instead", ex);
                     }
-                    catch (Exception ex)
-                    {
-                        log.debug("Unable to play spoken lag alert", ex);
-                    }
-                    finally
-                    {
-                        soundPending.set(false);
-                    }
-                });
+                }
             }
-            previouslyAlarmed = next.isAlarm();
         }
-        catch (RuntimeException ex)
+        catch (Throwable ex)
         {
-            // A thrown exception must not silently cancel all future scheduled checks.
-            log.debug("Lag watchdog check failed", ex);
+            log.debug("Unable to play any lag alert sound", ex);
         }
+        finally
+        {
+            soundPending.set(false);
+        }
+    }
+
+    static Runnable guarded(String name, Runnable task)
+    {
+        return () ->
+        {
+            try
+            {
+                task.run();
+            }
+            catch (Throwable ex)
+            {
+                log.debug("{} failed; it will run again on schedule", name, ex);
+            }
+        };
+    }
+
+    private static Thread daemon(Runnable runnable, String name, int priority)
+    {
+        Thread thread = new Thread(runnable, name);
+        thread.setDaemon(true);
+        thread.setPriority(priority);
+        return thread;
     }
 
     private boolean isCurrent(long generation)
