@@ -3,8 +3,11 @@ package com.lagalarm;
 import java.io.FileDescriptor;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
+import net.runelite.client.plugins.worldhopper.ping.LinuxTCPInfo;
+import net.runelite.client.plugins.worldhopper.ping.MacOSTCPConnectionInfo;
 import net.runelite.client.plugins.worldhopper.ping.Ping;
 import net.runelite.client.plugins.worldhopper.ping.TCPInfo;
+import net.runelite.client.plugins.worldhopper.ping.TCP_INFO_v0;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,6 +35,9 @@ final class GameSocketMonitor
     private CapturedSocket previous;
     private long retryAt;
     private int queryFailures;
+    // Cleared for good if RuneLite's platform structures no longer have the expected fields.
+    private boolean ackCountersSupported = true;
+    private final long[] ackCounters = new long[2];
 
     GameSocketMonitor(Client client, LagDetector detector)
     {
@@ -114,11 +120,12 @@ final class GameSocketMonitor
             {
                 // Native RTT is microseconds. Preserve valid sub-millisecond measurements.
                 int rtt = (int) Math.min(Integer.MAX_VALUE, (info.getRTT() + 999) / 1000);
+                readAckCounters(info);
                 if (active)
                 {
                     // The detector rejects results from an old world, generation or socket.
                     detector.recordTcpSample(captured.connection, captured.gameSocket,
-                        rtt, info.getTransmitted(), info.getRetransmitted(), now());
+                        rtt, info.getTransmitted(), info.getRetransmitted(), ackCounters[0], ackCounters[1], now());
                 }
                 queryFailures = 0;
                 return;
@@ -134,6 +141,56 @@ final class GameSocketMonitor
         }
         queryFailures = Math.min(MAX_FAILURES, queryFailures + 1);
         retryAt = now() + retryDelay(queryFailures);
+    }
+
+    // Fills {acknowledged bytes, unacknowledged amount}, or -1 for both when unavailable. These are public
+    // fields of RuneLite's platform structures rather than its common interface, so a failure here only
+    // removes this optional evidence; RTT and retransmission statistics continue as before.
+    private void readAckCounters(TCPInfo info)
+    {
+        ackCounters[0] = ackCounters[1] = -1;
+        if (!ackCountersSupported)
+        {
+            return;
+        }
+        try
+        {
+            long acked = -1;
+            long unacked = -1;
+            if (info instanceof TCP_INFO_v0)
+            {
+                TCP_INFO_v0 windows = (TCP_INFO_v0) info;
+                unacked = windows.BytesInFlight.longValue();
+                acked = windows.BytesOut.longValue() - windows.BytesRetrans.longValue() - unacked;
+            }
+            else if (info instanceof LinuxTCPInfo)
+            {
+                LinuxTCPInfo linux = (LinuxTCPInfo) info;
+                // Kernels that predate bytes_acked leave it at zero; that must not look like a stall.
+                if (linux.bytes_acked > 0)
+                {
+                    acked = linux.bytes_acked;
+                    unacked = linux.unacked & 0xFFFFFFFFL;
+                }
+            }
+            else if (info instanceof MacOSTCPConnectionInfo)
+            {
+                MacOSTCPConnectionInfo mac = (MacOSTCPConnectionInfo) info;
+                unacked = mac.snd_sbbytes & 0xFFFFFFFFL;
+                acked = mac.txbytes - mac.txretransmitbytes - unacked;
+            }
+            if (acked >= 0 && unacked >= 0)
+            {
+                ackCounters[0] = acked;
+                ackCounters[1] = unacked;
+            }
+        }
+        catch (RuntimeException | LinkageError ex)
+        {
+            ackCountersSupported = false;
+            ackCounters[0] = ackCounters[1] = -1;
+            log.debug("Acknowledgement counters unavailable; other socket statistics remain active", ex);
+        }
     }
 
     void stop()

@@ -139,6 +139,8 @@ final class LagAlarmPainter
                 return "Sustained high ping - latest " + snapshot.pingMs + " ms";
             case TCP_LATENCY:
                 return "Game connection latency is high - latest " + snapshot.tcpRttMs + " ms";
+            case TCP_STALL:
+                return "Game connection is not acknowledging sent data";
             case TCP_RETRANSMISSIONS:
                 return "Game connection is repeatedly retransmitting data";
             case PROBE_DELAY:

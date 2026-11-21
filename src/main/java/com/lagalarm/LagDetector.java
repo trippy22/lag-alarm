@@ -27,6 +27,7 @@ final class LagDetector
         HIGH_PING,
         TCP_LATENCY,
         TCP_RETRANSMISSIONS,
+        TCP_STALL,
         PROBE_DELAY,
         PROBE_FAILURES,
         RECOVERING,
@@ -303,11 +304,18 @@ final class LagDetector
     synchronized void recordTcpSample(ConnectionToken connection, Object identity, int rtt,
         long transmitted, long retransmitted, long now)
     {
+        recordTcpSample(connection, identity, rtt, transmitted, retransmitted, -1, -1, now);
+    }
+
+    /** acked and unacked are -1 when acknowledgement progress is unavailable. */
+    synchronized void recordTcpSample(ConnectionToken connection, Object identity, int rtt,
+        long transmitted, long retransmitted, long acked, long unacked, long now)
+    {
         if (!currentSocket(connection, identity))
         {
             return;
         }
-        tcp.record(rtt, transmitted, retransmitted, gameUpdatesHealthy(now), now);
+        tcp.record(rtt, transmitted, retransmitted, acked, unacked, gameUpdatesHealthy(now), now);
     }
 
     synchronized void markTcpUnavailable(ConnectionToken connection, Object identity)
@@ -432,6 +440,10 @@ final class LagDetector
             {
                 reason = haveClientTick && now - lastClientTick >= CLIENT_TICK_STALE_MS
                     ? Reason.CLIENT_STALL : Reason.TICK_STALL;
+            }
+            else if (mode == Mode.MONITORING && settings.adaptive && tcp.ackStalled(now))
+            {
+                reason = Reason.TCP_STALL;
             }
             else if (mode == Mode.MONITORING && settings.adaptive && tcp.repeatedRetries(now))
             {

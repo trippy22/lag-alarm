@@ -8,6 +8,9 @@ final class TcpHealth
     private static final int HIGH_LATENCY_DURATION_MS = 500;
     private static final int RETRANSMISSION_WINDOW_MS = 3000;
     private static final double MIN_RETRANSMISSION_RATIO = 0.10;
+    private static final int ACK_POLL_MAX_AGE_MS = 1000;
+    private static final int MIN_ACK_STALL_MS = 500;
+    private static final int MAX_ACK_STALL_MS = 1500;
 
     private final LatencyBaseline baseline = new LatencyBaseline();
     private final long[] times = new long[32];
@@ -24,6 +27,11 @@ final class TcpHealth
     private int healthySamples;
     private boolean high;
     private int rtt = -1;
+    // Optional acknowledgement progress. Not every platform or RuneLite version provides it.
+    private long lastAcked = -1;
+    private long ackProgressAt = -1;
+    private long ackPolledAt = -1;
+    private boolean awaitingAck;
 
     void reset()
     {
@@ -37,16 +45,26 @@ final class TcpHealth
         cursor = count = highSamples = healthySamples = 0;
         high = false;
         rtt = -1;
+        lastAcked = ackProgressAt = ackPolledAt = -1;
+        awaitingAck = false;
         baseline.pauseLearning();
     }
 
     void record(int latency, long transmitted, long retransmitted, boolean gameHealthy, long now)
+    {
+        record(latency, transmitted, retransmitted, -1, -1, gameHealthy, now);
+    }
+
+    /** acked and unacked are -1 when the platform cannot report them. */
+    void record(int latency, long transmitted, long retransmitted, long acked, long unacked, boolean gameHealthy, long now)
     {
         if (latency <= 0 || transmitted < 0 || retransmitted < 0)
         {
             suspend();
             return;
         }
+        boolean replaced = lastSent >= 0 && (transmitted < lastSent || retransmitted < lastRetried);
+        trackAcks(replaced ? -1 : acked, unacked, now);
         if (lastSent < 0 || transmitted < lastSent || retransmitted < lastRetried)
         {
             // A socket replacement or counter wrap must never look like massive packet loss.
@@ -122,12 +140,52 @@ final class TcpHealth
 
     boolean healthy(long now)
     {
-        return fresh(now) && baseline.isAvailable() && rtt < baseline.highThreshold() && !hasRetries(now);
+        return fresh(now) && baseline.isAvailable() && rtt < baseline.highThreshold() && !hasRetries(now)
+            && !ackStalled(now);
     }
 
     boolean learningSafe(long now)
     {
-        return !fresh(now) || (!hasRetries(now) && (!baseline.isAvailable() || rtt < baseline.highThreshold()));
+        return !ackStalled(now)
+            && (!fresh(now) || (!hasRetries(now) && (!baseline.isAvailable() || rtt < baseline.highThreshold())));
+    }
+
+    // Unlike the counters, "data is waiting for an acknowledgement" is a state: every poll is evidence.
+    private void trackAcks(long acked, long unacked, long now)
+    {
+        if (acked < 0 || unacked < 0)
+        {
+            lastAcked = ackProgressAt = ackPolledAt = -1;
+            awaitingAck = false;
+            return;
+        }
+        // The wait is timed from the first poll that saw unacknowledged data, never from an earlier idle
+        // poll: the data may have been sent just before this poll, and a late start cannot overstate a stall.
+        // Only an increase is progress; a platform may account for retransmitted bytes differently.
+        if (unacked > 0 && (!awaitingAck || lastAcked < 0 || acked > lastAcked))
+        {
+            ackProgressAt = now;
+        }
+        lastAcked = acked;
+        awaitingAck = unacked > 0;
+        ackPolledAt = now;
+    }
+
+    boolean ackTracking(long now)
+    {
+        return ackPolledAt >= 0 && now - ackPolledAt <= ACK_POLL_MAX_AGE_MS;
+    }
+
+    /** Sent data has gone unacknowledged for longer than one lost packet normally takes to recover. */
+    boolean ackStalled(long now)
+    {
+        if (!ackTracking(now) || !awaitingAck)
+        {
+            return false;
+        }
+        int normal = baseline.isAvailable() ? baseline.normalPing() : Math.max(0, rtt);
+        int limit = Math.min(MAX_ACK_STALL_MS, Math.max(MIN_ACK_STALL_MS, normal * 3 + 300));
+        return ackPolledAt - ackProgressAt >= limit;
     }
 
     boolean highLatency(long now)
